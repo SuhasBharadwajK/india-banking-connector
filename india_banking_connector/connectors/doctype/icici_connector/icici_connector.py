@@ -203,7 +203,7 @@ class ICICIConnector(BankConnector):
 
 			return json.dumps(
 				{
-					"requestId": get_id(10, payment_details.name),
+					"requestId": get_id(10, payment_details.name or payment_details.company_account_number),
 					"service": "",
 					"oaepHashingAlgorithm": "NONE",
 					"encryptedKey": encrypted_key,
