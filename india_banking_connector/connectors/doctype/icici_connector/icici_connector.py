@@ -14,14 +14,11 @@ from india_banking_connector.connectors.bank_connector import BankConnector
 from india_banking_connector.india_banking_connector.doctype.bank_request_log.bank_request_log import (
 	create_api_log,
 )
-from india_banking_connector.utils import get_id
+from india_banking_connector.utils import get_id, generate_random_key, load_file_as_stream, generate_sha512_hash
 
 
 class ICICIConnector(BankConnector):
 	bank = "ICICI Bank"
-
-	AES_KEY = "1234567887654321".encode("utf-8")
-	IV = "0000000000000000".encode("utf-8")
 
 	__all__ = ["initiate_payment", "get_payment_status"]
 
@@ -39,7 +36,7 @@ class ICICIConnector(BankConnector):
 	def headers(self, mode_of_transfer=None, params=None):
 		headers = {
 			"accept": "*/*",
-			"content-type": "text/plain",
+			"Content-Type": "application/json; charset=utf-8",
 			"apikey": self.client_key,
 			"host": self.urls.host,
 		}
@@ -47,7 +44,6 @@ class ICICIConnector(BankConnector):
 		if self.bulk_transaction:
 			headers.update(
 				{
-					"content-type": "application/json",
 					"x-priority": self.get_priority(mode_of_transfer),
 				}
 			)
@@ -64,7 +60,7 @@ class ICICIConnector(BankConnector):
 		headers = self.headers()
 		payload = self.get_encrypted_payload(method="register")
 
-		response = requests.post(url, headers=headers, data=payload)
+		response = requests.post(url, headers=headers, json=payload, verify=True, timeout=(10, 30))
 
 		log_id = create_api_log(
 			response,
@@ -87,7 +83,7 @@ class ICICIConnector(BankConnector):
 		headers = self.headers()
 		payload = self.get_encrypted_payload(method="registration_status")
 
-		response = requests.post(url, headers=headers, data=payload)
+		response = requests.post(url, headers=headers, json=payload, verify=True, timeout=(10, 30))
 
 		log_id = create_api_log(
 			response,
@@ -118,10 +114,10 @@ class ICICIConnector(BankConnector):
 			return existing_payment_response
 
 		url = self.urls.make_payment
-		headers = self.headers(payment_details.mode_of_transfer)
+		headers = self.headers()
 		payload = self.get_encrypted_payload(method="make_payment")
 
-		response = requests.post(url, headers=headers, data=payload)
+		response = requests.post(url, headers=headers, json=payload, verify=True, timeout=(10, 30))
 
 		log_id = create_api_log(
 			response,
@@ -149,7 +145,7 @@ class ICICIConnector(BankConnector):
 		headers = self.headers(mode_of_transfer)
 		payload = self.get_encrypted_payload(method="payment_status")
 
-		response = requests.post(url, headers=headers, data=payload)
+		response = requests.post(url, headers=headers, json=payload, verify=True, timeout=(10, 30))
 
 		log_id = create_api_log(
 			response,
@@ -172,7 +168,7 @@ class ICICIConnector(BankConnector):
 		headers = self.headers(payment_details.mode_of_transfer)
 		payload = self.get_encrypted_payload(method="generate_otp")
 
-		response = requests.post(url, headers=headers, data=payload)
+		response = requests.post(url, headers=headers, json=payload, verify=True, timeout=(10, 30))
 
 		log_id = create_api_log(
 			response,
@@ -189,30 +185,32 @@ class ICICIConnector(BankConnector):
 	def get_priority(self, mode_of_transfer):
 		return {"RTGS": "0001", "IMPS": "0100"}.get(mode_of_transfer, "0010")
 
-	def get_encrypted_payload(self, method):
+	def get_encrypted_payload(self, method: str):
 		connector_doc = self
 
 		payment_details = self.payment_doc if not self.bulk_transaction else self.doc
 
 		data = self.get_account_config(method)
+		random_aes_key = generate_random_key(32)
 
 		if self.bulk_transaction:
-			encrypted_key = self.rsa_encrypt_key(
-				self.AES_KEY, self.get_file_relative_path(connector_doc.public_key)
-			)
+			# Generate an IV using a predefined length - say 16 chars
+			init_vector = generate_random_key(16)
 
-			return json.dumps(
-				{
-					"requestId": get_id(10, payment_details.name),
-					"service": "",
-					"oaepHashingAlgorithm": "NONE",
-					"encryptedKey": encrypted_key,
-					"encryptedData": self.aes_encrypt_data(data, self.AES_KEY),
-					"clientInfo": "",
-					"optionalParam": "",
-					"iv": b64encode(self.IV).decode("utf-8"),
-				}
-			)
+			encrypted_key = self.get_rsa_encrypted_aes_key(random_aes_key.encode().decode(), self.get_file_relative_path(connector_doc.public_key))
+			encrypted_data = self.get_aes_encrypted_payload(random_aes_key, init_vector, data)
+
+			return {
+				"requestId": get_id(10, payment_details.name or payment_details.company_account_number),
+				"service": "proxyPathSuffix",
+				"oaepHashingAlgorithm": "NONE",
+				"encryptedKey": encrypted_key,
+				"encryptedData": encrypted_data,
+				"clientInfo": "",
+				"optionalParam": "",
+				"iv": "",
+			}
+			
 		else:
 			public_key_path = self.get_file_relative_path(connector_doc.public_key)
 			return self.rsa_encrypt_data(data, public_key_path)
@@ -405,7 +403,7 @@ class ICICIConnector(BankConnector):
 			data.update(
 				{
 					"CORPID": connector_doc.corp_id,
-					"USERID": connector_doc.status_corp_usr,
+					"USERID": f'{connector_doc.corp_id}.{connector_doc.status_corp_usr}',
 					"AGGRID": connector_doc.aggr_id,
 					"URN": connector_doc.urn,
 					"UNIQUEID": unique_id,
@@ -433,7 +431,7 @@ class ICICIConnector(BankConnector):
 
 			if self.bulk_transaction:
 				response = json.loads(response)
-				decrypted_key = self.rsa_decrypt_key(
+				decrypted_key = self.rsa_decrypt(
 					response.get("encryptedKey"),
 					self.get_file_relative_path(connector_doc.private_key),
 				)
@@ -443,7 +441,7 @@ class ICICIConnector(BankConnector):
 
 			elif method == "bank_statement":
 				response = json.loads(response)
-				decrypted_key = self.rsa_decrypt_key(
+				decrypted_key = self.rsa_decrypt(
 					response.get("encryptedKey"),
 					self.get_file_relative_path(connector_doc.private_key),
 				)
@@ -700,10 +698,10 @@ class ICICIConnector(BankConnector):
 
 		self.update_client_details("bank_balance")
 		url = self.urls.bank_balance
-		headers = self.headers(params={"content-type": "text/plain"})
+		headers = self.headers()
 		payload = self.get_encrypted_payload(method="bank_balance")
 
-		response = requests.post(url, headers=headers, data=payload)
+		response = requests.post(url, headers=headers, json=payload, verify=True, timeout=(10, 30))
 
 		log_id = create_api_log(
 			response,
@@ -723,10 +721,10 @@ class ICICIConnector(BankConnector):
 
 		self.update_client_details("bank_statement")
 		url = self.urls.bank_statement
-		headers = self.headers(params={"content-type": "text/plain"})
+		headers = self.headers()
 		payload = self.get_encrypted_payload(method="bank_statement")
 
-		response = requests.post(url, headers=headers, data=payload)
+		response = requests.post(url, headers=headers, json=payload, verify=True, timeout=(10, 30))
 
 		log_id = create_api_log(
 			response,
