@@ -10,9 +10,15 @@ from Crypto.PublicKey import RSA
 from Crypto.Util.Padding import pad, unpad
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.backends import default_backend
+
 from frappe.model.document import Document
 from frappe.query_builder import DocType
 from jose import jwe, jws
+
+from india_banking_connector.utils import load_file_as_stream, generate_random_key, add_pkcs5_padding, remove_pkcs5_padding
 
 
 class BankConnector(Document):
@@ -100,6 +106,39 @@ class BankConnector(Document):
 
 		return jws.sign(content_bytes, private_key, algorithm="RS256", headers=headers)
 
+
+	def load_public_key(self, filename: str):
+		"""
+		Loads an RSA public key from a file.
+
+		:param filename: The path to the public key file.
+		:return: An RSA public key object.
+		:raises Exception: If the key cannot be loaded or parsed.
+		"""
+		try:
+				file_bytes = load_file_as_stream(filename) 
+				key = serialization.load_pem_public_key(file_bytes)
+				return key
+		except Exception as e:
+				raise ValueError(f"Invalid PEM-encoded public key: {e}")
+
+	def load_private_key(self, filename: str):
+		"""
+		Loads an RSA private key from a file.
+
+		:param filename: The path to the public key file.
+		:return: An RSA private key object.
+		:raises Exception: If the key cannot be loaded or parsed.
+		"""
+		try:
+				file_bytes = load_file_as_stream(filename) 
+				key = serialization.load_pem_private_key(file_bytes, password=None, backend=default_backend())
+				return key
+		except Exception as e:
+				raise ValueError(f"Invalid PEM-encoded public key: {e}")
+		pass
+
+
 	def encrypt_payload(self, payload):
 		jws_signed = self.generate_jws_with_rs256(
 			payload,
@@ -186,47 +225,117 @@ class BankConnector(Document):
 
 	# ICICI Encryption and Decryption
 
-	def rsa_encrypt_key(self, key, key_path):
-		if isinstance(key, str):
-			key = key.encode("utf-8")
+	def rsa_encrypt(self, message, public_key):
+		ciphertext = public_key.encrypt(
+				message.encode(),
+				padding.PKCS1v15()  # Use PKCS1v15 padding in the encrypt function as well
+		)
 
-		with open(key_path, "rb") as file:
-			public_key = rsa.PublicKey.load_pkcs1(file.read())
-			encrypted_key = rsa.encrypt(key, public_key)
-			return b64encode(encrypted_key).decode("utf-8")
+		return ciphertext
 
-	def rsa_decrypt_key(self, key, key_path):
-		with open(key_path, "rb") as file:
-			private_key = rsa.PrivateKey.load_pkcs1(file.read())
-			return rsa.decrypt(b64decode(key), private_key).decode("utf-8")
 
-	def aes_encrypt_data(self, data, key):
+	def encrypt_key(self, message: str, public_key) -> str:
+			try:
+					ciphertext = self.rsa_encrypt(message, public_key)
+					return b64encode(ciphertext).decode('utf-8')
+			except Exception as e:
+					raise Exception(f"Error encrypting message: {e}")
+
+
+	def get_rsa_encrypted_aes_key(self, aes_key, public_key_path):
+		try:
+			# Get the server public key stream from the key path
+			#		Using the the serialization utility in the cryptography library, load the PEM public key.
+			public_key = self.load_public_key(public_key_path)
+
+			# Using the server's public key, encrypt the AES key to get the get encrypted AES key.
+			# Return the encrypted AES key encoded in Base64
+			return self.encrypt_key(aes_key, public_key)
+
+		except Exception as e:
+			logger.error("An error occurred while encrypting: %s", e)
+			return None
+	
+
+	def get_aes_encrypted_payload(self, aes_key: str, init_vector: str, data: str):
 		if isinstance(data, dict):
 			data = json.dumps(data)
 
-		if isinstance(key, str):
-			key = key.encode("utf-8")
+		try:
+				# Encryption    
+				cipher = Cipher(algorithms.AES(aes_key.encode()), modes.CBC(init_vector.encode()), backend=default_backend())
+				encryptor = cipher.encryptor()
+				message = data.encode()
 
-		padded = pad(data.encode("utf-8"), AES.block_size)
+				padded_data = add_pkcs5_padding(message, 16)
+				ciphertext = encryptor.update(padded_data) # + encryptor.finalize()
+				ciphertext = init_vector.encode() + ciphertext
 
-		cipher = AES.new(key, AES.MODE_CBC, self.IV)
+				return b64encode(ciphertext).decode()
+		
+		except Exception as e:
+				logger.error("An error occurred while encrypting: %s", e)
+				return None
+		pass
 
-		encrypted = cipher.encrypt(padded)
 
-		return b64encode(encrypted).decode("utf-8")
+	def rsa_decrypt(self, message, private_key_path):
+		try:
+			private_key = self.load_private_key(private_key_path)
+			decoded_message = b64decode(message)
 
-	def aes_decrypt_data(self, data, key, json_loads=True):
-		if isinstance(key, str):
-			key = key.encode("utf-8")
+			decrypted_message = private_key.decrypt(
+					decoded_message,
+					padding.PKCS1v15() # Use PKCS1v15 padding in the decrypt function as well
+			)
 
-		cipher = AES.new(key, AES.MODE_CBC, self.IV)
+			return decrypted_message.decode('utf-8')
 
-		decrypted = cipher.decrypt(b64decode(data))
+		except Exception as e:
+			raise e
 
+	def aes_encrypt_data(self, data, key, iv):
+		if isinstance(data, dict):
+			data = json.dumps(data)
+
+		try:
+			cipher = Cipher(algorithms.AES(key.encode()), modes.CBC(iv.encode()), backend=default_backend())
+			encryptor = cipher.encryptor()
+			message = data.encode()
+
+			padded = pad(message, AES.block_size)
+
+			ciphertext = encryptor.update(padded)
+			ciphertext = iv.encode() + ciphertext
+
+
+			return b64encode(ciphertext).decode("utf-8")
+		except Exception as e:
+			raise e
+
+	def aes_decrypt_data(self, encrypted_str, aes_key, json_loads=True):
+		if isinstance(aes_key, str):
+			aes_key = aes_key.encode("utf-8")
+
+		encrypted = b64decode(encrypted_str)
+		iv = encrypted[:16]  # Extract IV (first 16 bytes)
+		ciphertext = encrypted[16:]  # Extract ciphertext (remaining bytes)
+
+		key_length = len(aes_key)
+		if key_length not in (16, 24, 32):
+			raise ValueError("invalid aes key length. key must be 16, 24, or 32 bytes.")
+
+		iv_parameter_spec = modes.CBC(iv)  # Use CBC mode
+		cipher = Cipher(algorithms.AES(aes_key), iv_parameter_spec, backend=default_backend())
+		decryptor = cipher.decryptor()
+		plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+
+		decrypted_data = remove_pkcs5_padding(plaintext).decode('utf-8')
 		if not json_loads:
-			return unpad(decrypted, AES.block_size).decode("utf-8")
-
-		return json.loads(unpad(decrypted, AES.block_size))
+			return decrypted_data
+		
+		deserialized_data = json.loads(decrypted_data)
+		return deserialized_data
 
 	def rsa_encrypt_data(self, data, key_path):
 		if isinstance(data, dict):

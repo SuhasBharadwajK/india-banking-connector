@@ -3,6 +3,8 @@ import json
 import random
 import re
 import string
+import hashlib
+import binascii
 
 import frappe
 from cryptography.fernet import Fernet
@@ -46,6 +48,67 @@ def get_id(length: int = 10, text: str = "") -> str:
 			)
 
 
+def generate_random_key(key_length: int):
+	try:
+		char_set = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+		random_key = ''.join(random.choice(char_set) for _ in range(key_length))
+		return random_key
+
+	except Exception as e:
+		raise Exception(f'An exception occurred while generating random key: {e}')
+
+
+def add_pkcs5_padding(message, block_size):
+	"""Pads a message according to PKCS#5 padding scheme.
+
+	Args:
+			message: The message to be padded (bytes).
+			block_size: The size of the block (int).
+
+	Returns:
+			The padded message (bytes).
+	"""
+	padding_length = block_size - (len(message) % block_size)
+	padding = bytes([padding_length] * padding_length)
+	return message + padding
+
+
+def remove_pkcs5_padding(padded_message):
+	"""Removes PKCS#5 padding from a message.
+
+	Args:
+			padded_message: The padded message (bytes).
+
+	Returns:
+			The original message (bytes).
+			Raises ValueError if padding is invalid.
+	"""
+	if not padded_message:
+			raise ValueError("Empty padded message")
+
+	padding_length = padded_message[-1]  # Get padding length from the last byte
+
+	if padding_length > len(padded_message) or padding_length == 0:
+			raise ValueError("Invalid padding length")
+
+	padding = padded_message[-padding_length:]
+
+	if padding != bytes([padding_length] * padding_length): #Check if the padding bytes are correct.
+			raise ValueError("Invalid padding bytes")
+
+	return padded_message[:-padding_length]
+
+
+def load_file_as_stream(file_name: str):
+	try:
+		# assuming filename is sent with file path
+		with open(file_name, 'rb') as file_bytes:
+			return file_bytes.read()
+	except FileNotFoundError:
+		logger.error("An error occurred while loading the config")
+		raise FileNotFoundError(f"File not found: {file_name}")
+
+
 def encrypt(data, key=None):
 	if not key:
 		key = HASH_KEY
@@ -73,3 +136,21 @@ def decrypt(data, key=None):
 
 	decrypted_data = cipher.decrypt(data)
 	return json.loads(decrypted_data.decode("utf-8"))
+
+
+def generate_sha512_hash(input: str) -> str:
+	try:
+		digest = hashlib.sha512()  # Replace with the desired hash algorithm (e.g., sha1, md5)
+		digest.update(input.encode('utf-8'))
+		hashed_bytes = digest.digest()
+		return bytes_to_hexlify(hashed_bytes)  # Convert bytes to hexadecimal string
+	except Exception as e:
+		raise Exception(f"Error hashing string: {e}")
+
+
+def bytes_to_hexlify(hash_bytes):
+	"""Converts bytes to a hexadecimal string (similar to Java's bytesToHex)."""
+	# Method 1 (using binascii.hexlify - recommended):
+	hex_string = binascii.hexlify(hash_bytes).decode('utf-8') # Decode from bytes to string
+	return hex_string
+
